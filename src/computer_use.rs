@@ -491,7 +491,28 @@ mod tests {
     async fn llm_model_posts_jpeg_and_parses_actions() {
         use axum::routing::post;
         use axum::{Json, Router};
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
+
+        // Capture tracing output so we can assert the usage log actually fires.
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writer = captured.clone();
+        let _ = tracing_subscriber::fmt()
+            .with_writer(move || Buf(writer.clone()))
+            .try_init();
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -504,7 +525,8 @@ mod tests {
                     Json(serde_json::json!({
                         "choices": [{"message": {"content":
                             "{\"actions\":[{\"action\":\"click\",\"x\":0.2,\"y\":0.3},{\"action\":\"done\"}]}"
-                        }}]
+                        }}],
+                        "usage": {"prompt_tokens": 1234, "completion_tokens": 56, "total_tokens": 1290}
                     }))
                 }),
             );
@@ -525,6 +547,16 @@ mod tests {
                 Action::Click { x: 0.2, y: 0.3 },
                 Action::Done
             ]
+        );
+        let captured_bytes = captured.lock().unwrap().clone();
+        let log = String::from_utf8_lossy(&captured_bytes);
+        assert!(
+            log.contains("llm computer-use usage"),
+            "origin computer-use path must log model token usage; got: {log}"
+        );
+        assert!(
+            log.contains("1290") && log.contains("1234"),
+            "logged usage must carry the reported token counts; got: {log}"
         );
     }
 }

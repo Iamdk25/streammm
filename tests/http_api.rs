@@ -57,6 +57,46 @@ async fn config_post_clamps_and_round_trips() {
 }
 
 #[tokio::test]
+async fn config_post_live_applies_snapshot_interval_to_atomic() {
+    use std::sync::atomic::Ordering;
+
+    let (_dir, app) = temp_app();
+    // Fresh app starts with the default interval.
+    assert_eq!(app.snapshot_interval.load(Ordering::Relaxed), 8);
+
+    let router = app.clone().router();
+    // Clamped low (1 -> 5) must reach the live interval the snapshot loop reads.
+    let res = router
+        .clone()
+        .oneshot(
+            Request::post("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "snapshot_interval_secs": 1 }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(app.snapshot_interval.load(Ordering::Relaxed), 5);
+    assert_eq!(app.cfg.lock().snapshot_interval_secs, 5);
+
+    // Clamped high (99999 -> 3600) must reach the live interval too.
+    let res = router
+        .clone()
+        .oneshot(
+            Request::post("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "snapshot_interval_secs": 99999 }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(app.snapshot_interval.load(Ordering::Relaxed), 3600);
+    assert_eq!(app.cfg.lock().snapshot_interval_secs, 3600);
+}
+
+#[tokio::test]
 async fn token_rejects_unauthorized_and_accepts_bearer() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.json");
