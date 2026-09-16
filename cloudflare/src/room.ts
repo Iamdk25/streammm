@@ -556,7 +556,8 @@ export class StreamRoom extends DurableObject<Env> {
     if (this.analyzing) {
       return this.lastAnalysis ?? { ts: new Date().toISOString(), summary: "", questions: [] };
     }
-    const snapHash = await sha256buf(this.lastSnap!);
+    const snap = this.lastSnap!;
+    const snapHash = await sha256buf(snap);
     if (!force && shouldSkipAutoAnalysis(this.lastAnalysis, snapHash)) {
       // Frame unchanged since the last pass: reuse that result instead of
       // spending another paid vision call.
@@ -566,7 +567,7 @@ export class StreamRoom extends DurableObject<Env> {
     const seq = this.snapSeq;
     try {
       const { text, usage } = await completeVision(
-        this.lastSnap!,
+        snap,
         ANALYZE_PROMPT,
         this.apiKey(),
         this.env.DEEPSEEK_BASE_URL || DEFAULT_BASE,

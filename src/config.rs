@@ -319,6 +319,7 @@ mod tests {
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 8080);
         assert_eq!(cfg.token, "");
+        assert_eq!(cfg.snapshot_interval_secs, 8);
         assert_eq!(cfg.capture.driver, "ffmpeg");
         assert_eq!(cfg.capture.fps, 30);
         assert_eq!(cfg.capture.scale, 1.0);

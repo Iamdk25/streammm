@@ -135,6 +135,9 @@ impl LlmActionModel {
         let Ok(v) = res.json::<Value>().await else {
             return vec![Action::Done];
         };
+        if let Some(usage) = v.pointer("/usage") {
+            tracing::info!(step, usage = %usage, "llm computer-use usage");
+        }
         let content = v
             .pointer("/choices/0/message/content")
             .and_then(|c| c.as_str())

@@ -537,6 +537,7 @@ async fn api_config_post(State(app): State<Arc<App>>, req: Request) -> Response 
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
     *app.cfg.lock() = new_cfg.clone();
+    app.snapshot_interval.store(new_cfg.snapshot_interval_secs as u64, Ordering::Relaxed);
     app.publisher.set_config(new_cfg.clone());
     if config::cloudflare_endpoint_changed(&old, &new_cfg) {
         app.publisher.start();
