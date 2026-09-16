@@ -39,7 +39,7 @@ Killing the process is not enough — `KeepAlive` will restart it. Logs: `logs/o
 | GOP | 15 frames (~0.5 s join / live edge) |
 | Size | cap **3840×4320**, **never upscale**, lanczos only if the display is larger |
 | fps | 30 |
-| Snapshot | every **8 s** (`snapshot_interval_secs`, 5–3600 s), ≤1920 px wide, JPEG q6, published to the Worker for analysis |
+| Snapshot | every **8 s** (`snapshot_interval_secs`, 5–3600 s) while the capture produces new media, ≤1920 px wide, JPEG q6, published to the Worker for analysis (a stalled capture publishes nothing) |
 
 ## Global watch link (OTP PIN)
 

@@ -15,6 +15,9 @@ pub struct Media {
     pub data: Bytes,
     pub width: u32,
     pub height: u32,
+    /// Hub-assigned identity of this media; unchanged while `latest` is not
+    /// replaced, so consumers can tell a fresh frame from a re-served one.
+    pub seq: u64,
 }
 
 struct Client {
@@ -76,6 +79,7 @@ impl Hub {
             data: data.clone(),
             width: w,
             height: h,
+            seq: next_seq(),
         };
         let mut g = self.inner.lock();
         g.init = Some(data);
@@ -91,6 +95,7 @@ impl Hub {
             data,
             width: w,
             height: h,
+            seq: next_seq(),
         };
         let mut g = self.inner.lock();
         // TYPE_SNAP is for the Worker LLM only. Fan it out (publisher needs it)
@@ -278,7 +283,7 @@ pub fn kind_for_mode(mode: &str, is_init: bool) -> u8 {
 
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[allow(dead_code)]
+/// Identity assigned to each published media unit.
 pub fn next_seq() -> u64 {
     FRAME_SEQ.fetch_add(1, Ordering::Relaxed)
 }
