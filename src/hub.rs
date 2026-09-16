@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 #[derive(Clone, Debug)]
@@ -15,6 +15,9 @@ pub struct Media {
     pub data: Bytes,
     pub width: u32,
     pub height: u32,
+    /// Hub-assigned identity of this media; unchanged while `latest` is not
+    /// replaced, so consumers can tell a fresh frame from a re-served one.
+    pub seq: u64,
 }
 
 struct Client {
@@ -26,6 +29,7 @@ struct Client {
 struct Inner {
     latest: Option<Media>,
     snap: Option<Media>,
+    snap_seq: u64,
     init: Option<Bytes>,
     width: u32,
     height: u32,
@@ -34,6 +38,7 @@ struct Inner {
     gen: u64,
     ts: VecDeque<Instant>,
     last_at: Option<Instant>,
+    snap_notify: Arc<Notify>,
 }
 
 #[derive(Clone)]
@@ -54,6 +59,7 @@ impl Hub {
             inner: Arc::new(Mutex::new(Inner {
                 latest: None,
                 snap: None,
+                snap_seq: 0,
                 init: None,
                 width: 0,
                 height: 0,
@@ -62,6 +68,7 @@ impl Hub {
                 gen: 0,
                 ts: VecDeque::new(),
                 last_at: None,
+                snap_notify: Arc::new(Notify::new()),
             })),
         }
     }
@@ -72,6 +79,7 @@ impl Hub {
             data: data.clone(),
             width: w,
             height: h,
+            seq: next_seq(),
         };
         let mut g = self.inner.lock();
         g.init = Some(data);
@@ -87,12 +95,15 @@ impl Hub {
             data,
             width: w,
             height: h,
+            seq: next_seq(),
         };
         let mut g = self.inner.lock();
         // TYPE_SNAP is for the Worker LLM only. Fan it out (publisher needs it)
         // but never treat it as the live fragment — that would black-screen late joins.
         if kind == TYPE_SNAP {
             g.snap = Some(media.clone());
+            g.snap_seq += 1;
+            g.snap_notify.notify_waiters();
         }
         if kind != TYPE_INIT && kind != TYPE_SNAP {
             let now = Instant::now();
@@ -158,6 +169,32 @@ impl Hub {
 
     pub fn last_snap(&self) -> Option<Media> {
         self.inner.lock().snap.clone()
+    }
+
+    /// Monotonic counter of published TYPE_SNAP units.
+    pub fn snap_seq(&self) -> u64 {
+        self.inner.lock().snap_seq
+    }
+
+    /// Resolves when a snapshot newer than `seq` is published, or after `timeout`.
+    /// Returns the snapshot sequence at whichever point ends the wait.
+    pub async fn wait_for_snap_after(&self, seq: u64, timeout: Duration) -> u64 {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let (cur, notify) = {
+                let g = self.inner.lock();
+                (g.snap_seq, g.snap_notify.clone())
+            };
+            if cur != seq {
+                return cur;
+            }
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.inner.lock().snap_seq;
+                }
+            }
+        }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -246,7 +283,7 @@ pub fn kind_for_mode(mode: &str, is_init: bool) -> u8 {
 
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[allow(dead_code)]
+/// Identity assigned to each published media unit.
 pub fn next_seq() -> u64 {
     FRAME_SEQ.fetch_add(1, Ordering::Relaxed)
 }
@@ -323,5 +360,29 @@ mod tests {
         }
         assert!(kinds.contains(&TYPE_SNAP));
         assert!(kinds.contains(&TYPE_FRAG));
+    }
+
+    #[tokio::test]
+    async fn wait_for_snap_after_returns_when_new_snap_publishes() {
+        let hub = Hub::new();
+        let seq0 = hub.snap_seq();
+        let h = hub.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            h.publish_unit(TYPE_SNAP, Bytes::from_static(b"\xff\xd8new"), 0, 0);
+        });
+        let next = hub.wait_for_snap_after(seq0, Duration::from_secs(5)).await;
+        assert_ne!(next, seq0);
+        assert_eq!(next, hub.snap_seq());
+    }
+
+    #[tokio::test]
+    async fn wait_for_snap_after_times_out_without_new_snap() {
+        let hub = Hub::new();
+        let seq0 = hub.snap_seq();
+        let start = Instant::now();
+        let next = hub.wait_for_snap_after(seq0, Duration::from_millis(120)).await;
+        assert_eq!(next, seq0);
+        assert!(start.elapsed() >= Duration::from_millis(100));
     }
 }

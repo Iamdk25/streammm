@@ -135,6 +135,9 @@ impl LlmActionModel {
         let Ok(v) = res.json::<Value>().await else {
             return vec![Action::Done];
         };
+        if let Some(usage) = v.pointer("/usage") {
+            tracing::info!(step, usage = %usage, "llm computer-use usage");
+        }
         let content = v
             .pointer("/choices/0/message/content")
             .and_then(|c| c.as_str())
@@ -262,17 +265,20 @@ pub fn run_task(
     applied
 }
 
-pub async fn run_task_async<G, Fut>(
+pub async fn run_task_async<G, Fut, W, FutW>(
     task: &str,
     model: &dyn ActionModel,
     injector: &dyn Injector,
     mut grab: G,
+    mut wait_fresh: W,
     max_steps: u32,
     cancel: &AtomicBool,
 ) -> Vec<Action>
 where
     G: FnMut() -> Fut,
     Fut: Future<Output = Vec<u8>>,
+    W: FnMut() -> FutW,
+    FutW: Future<Output = bool>,
 {
     let mut applied = Vec::new();
     let task = task.trim();
@@ -283,7 +289,17 @@ where
         if cancel.load(Ordering::SeqCst) {
             break;
         }
+        // Steps after the first wait for a FRESH snapshot: planning again on the
+        // same frame burns a paid call and cannot observe the actions just
+        // applied. `false` means no fresh frame arrived in time, so stop instead
+        // of looping on a frozen screen.
+        if step > 0 && !wait_fresh().await {
+            break;
+        }
         let jpeg = grab().await;
+        if jpeg.is_empty() {
+            break;
+        }
         let actions = model.plan_async(task, step, &jpeg).await;
         for a in actions {
             if cancel.load(Ordering::SeqCst) {
@@ -423,12 +439,43 @@ mod tests {
                     b"\xff\xd8snap".to_vec()
                 }
             },
+            || async { true },
             MAX_STEPS,
             &cancel,
         )
         .await;
         assert_eq!(applied.last(), Some(&Action::Done));
         assert!(grabs.load(Ordering::SeqCst) >= 3, "need a snapshot per step");
+    }
+
+    #[tokio::test]
+    async fn async_loop_stops_when_no_fresh_frame_arrives() {
+        let inj = FakeInjector::new();
+        let model = StubClickTypeModel::default();
+        let cancel = AtomicBool::new(false);
+        let grabs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let g = grabs.clone();
+        let applied = run_task_async(
+            "t",
+            &model,
+            &inj,
+            || {
+                let g = g.clone();
+                async move {
+                    g.fetch_add(1, Ordering::SeqCst);
+                    b"\xff\xd8snap".to_vec()
+                }
+            },
+            || async { false }, // capture stalled: no fresh frame ever
+            MAX_STEPS,
+            &cancel,
+        )
+        .await;
+        // Step 0 runs without a wait; the stalled capture then stops the loop
+        // before it spends further calls on a frozen screen.
+        assert_eq!(grabs.load(Ordering::SeqCst), 1);
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0], Action::Click { x: 0.5, y: 0.5 });
     }
 
     #[tokio::test]
@@ -444,7 +491,28 @@ mod tests {
     async fn llm_model_posts_jpeg_and_parses_actions() {
         use axum::routing::post;
         use axum::{Json, Router};
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
+
+        // Capture tracing output so we can assert the usage log actually fires.
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writer = captured.clone();
+        let _ = tracing_subscriber::fmt()
+            .with_writer(move || Buf(writer.clone()))
+            .try_init();
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -457,7 +525,8 @@ mod tests {
                     Json(serde_json::json!({
                         "choices": [{"message": {"content":
                             "{\"actions\":[{\"action\":\"click\",\"x\":0.2,\"y\":0.3},{\"action\":\"done\"}]}"
-                        }}]
+                        }}],
+                        "usage": {"prompt_tokens": 1234, "completion_tokens": 56, "total_tokens": 1290}
                     }))
                 }),
             );
@@ -478,6 +547,16 @@ mod tests {
                 Action::Click { x: 0.2, y: 0.3 },
                 Action::Done
             ]
+        );
+        let captured_bytes = captured.lock().unwrap().clone();
+        let log = String::from_utf8_lossy(&captured_bytes);
+        assert!(
+            log.contains("llm computer-use usage"),
+            "origin computer-use path must log model token usage; got: {log}"
+        );
+        assert!(
+            log.contains("1290") && log.contains("1234"),
+            "logged usage must carry the reported token counts; got: {log}"
         );
     }
 }

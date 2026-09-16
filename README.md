@@ -39,6 +39,7 @@ Killing the process is not enough — `KeepAlive` will restart it. Logs: `logs/o
 | GOP | 15 frames (~0.5 s join / live edge) |
 | Size | cap **3840×4320**, **never upscale**, lanczos only if the display is larger |
 | fps | 30 |
+| Snapshot | every **8 s** (`snapshot_interval_secs`, 5–3600 s) while the capture produces new media, ≤1920 px wide, JPEG q6, published to the Worker for analysis (a stalled capture publishes nothing) |
 
 ## Global watch link (OTP PIN)
 
@@ -62,7 +63,7 @@ The Worker homepage is a player with PIN unlock, **Have AI use this computer**, 
 Remote control is **off by default**. On the origin UI, enable:
 
 - **Allow remote computer use** — the remote watcher can click / move / scroll / type on the live video (normalized 0–1 coordinates). Kill switch: uncheck it.
-- **Allow AI computer use** — the same watcher can submit a task in **Have AI use this computer**. The origin loops TYPE_SNAP JPEG → vision model JSON actions → the same injector. **Cancel AI** on the origin UI (`POST /api/computer-use/cancel`) stops a running loop.
+- **Allow AI computer use** — the same watcher can submit a task in **Have AI use this computer**. The origin loops fresh-snapshot JPEG → vision model JSON actions → the same injector: every step after the first waits for a new snapshot, so a step never re-plans on a stale frame and a stalled capture stops the loop instead of burning calls. **Cancel AI** on the origin UI (`POST /api/computer-use/cancel`) stops a running loop.
 
 macOS: grant **Streamaid** Accessibility (and Input Monitoring if prompted) in System Settings → Privacy & Security, in addition to Screen Recording. CI tests use a fake injector; they never post real HID events.
 
@@ -77,7 +78,7 @@ cd cloudflare
 npx wrangler secret put DEEPSEEK_API_KEY
 ```
 
-Until then the APIs return `503` with setup instructions. The origin already publishes a JPEG snapshot (`type 4`) about every 8 seconds while capturing. Viewers never receive those snapshots — they stay in the Durable Object for the model.
+Until then the APIs return `503` with setup instructions. The origin already publishes a JPEG snapshot (`type 4`) every `snapshot_interval_secs` (default 8 s) while capturing. Viewers never receive those snapshots — they stay in the Durable Object for the model.
 
 ## Cloudflare deploy
 
@@ -146,6 +147,8 @@ Model defaults (override with wrangler `vars`):
 - `DEEPSEEK_MODEL` = `deepseek-v4-flash-vision-exp`
 
 Same-origin player polls `/api/analysis` and also accepts a WebSocket JSON message `{ "type": "analysis", "data": … }` when a pass finishes.
+
+Credit guards: an automatic pass reuses the last result when the snapshot is byte-identical to the one already analyzed (no paid call for a static screen); `/api/analyze-now` forces a pass but is limited to one per 5 s; each analysis stores the model's reported token `usage` and logs it.
 
 ## Tests
 

@@ -18,11 +18,21 @@ export function askPrompt(question: string): string {
   );
 }
 
+export type Usage = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+};
+
 export type Analysis = {
   ts: string;
   summary: string;
   questions: { question: string; answer: string; confidence: number; reasoning: string }[];
   error?: string;
+  /** SHA-256 of the snapshot this pass analyzed; unchanged frames skip re-analysis. */
+  snapHash?: string;
+  /** Token usage reported by the model API, when present. */
+  usage?: Usage;
 };
 
 export type AskResult = {
@@ -104,7 +114,7 @@ export async function completeVision(
   apiKey: string,
   baseUrl: string,
   model: string,
-): Promise<string> {
+): Promise<{ text: string; usage: Usage | null }> {
   const url = baseUrl.replace(/\/$/, "") + "/chat/completions";
   const body = {
     model,
@@ -139,8 +149,16 @@ export async function completeVision(
   }
   const data = JSON.parse(text) as {
     choices?: { message?: { content?: string } }[];
+    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
   };
   const content = data.choices?.[0]?.message?.content;
   if (!content || !content.trim()) throw new Error("empty response from model");
-  return content;
+  const usage: Usage | null = data.usage
+    ? {
+        prompt_tokens: typeof data.usage.prompt_tokens === "number" ? data.usage.prompt_tokens : undefined,
+        completion_tokens: typeof data.usage.completion_tokens === "number" ? data.usage.completion_tokens : undefined,
+        total_tokens: typeof data.usage.total_tokens === "number" ? data.usage.total_tokens : undefined,
+      }
+    : null;
+  return { text: content, usage };
 }
