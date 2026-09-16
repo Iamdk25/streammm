@@ -215,7 +215,6 @@ impl App {
             std::time::Duration::from_secs(interval.saturating_mul(2).saturating_add(2));
         let grab_hub = hub.clone();
         let wait_hub = hub.clone();
-        let last_seq = Arc::new(AtomicU64::new(hub.snap_seq()));
         let cancel_flag = self.ai_cancel.clone();
         computer_use::run_task_async(
             task,
@@ -227,9 +226,11 @@ impl App {
             },
             move || {
                 let h = wait_hub.clone();
-                let s = last_seq.clone();
                 let cancel = cancel_flag.clone();
                 async move {
+                    // Baseline is the latest snapshot at the start of this wait,
+                    // i.e. after the previous step's actions were applied.
+                    let baseline = h.snap_seq();
                     // Wait in short chunks so a cancel stops the loop quickly
                     // instead of after the full fresh-frame timeout.
                     let mut remaining = fresh_timeout;
@@ -237,11 +238,9 @@ impl App {
                         if cancel.load(Ordering::SeqCst) {
                             return false;
                         }
-                        let prev = s.load(Ordering::Relaxed);
                         let chunk = remaining.min(std::time::Duration::from_millis(250));
-                        let next = h.wait_for_snap_after(prev, chunk).await;
-                        if next != prev {
-                            s.store(next, Ordering::Relaxed);
+                        let next = h.wait_for_snap_after(baseline, chunk).await;
+                        if next != baseline {
                             return true;
                         }
                         remaining = remaining.saturating_sub(chunk);
