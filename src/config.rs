@@ -202,6 +202,8 @@ pub struct Config {
     pub port: u16,
     #[serde(default)]
     pub token: String,
+    #[serde(default = "default_snapshot_interval")]
+    pub snapshot_interval_secs: u32,
     #[serde(default)]
     pub capture: CaptureConfig,
     #[serde(default)]
@@ -220,6 +222,9 @@ fn default_host() -> String {
 fn default_port() -> u16 {
     8080
 }
+fn default_snapshot_interval() -> u32 {
+    8
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -227,6 +232,7 @@ impl Default for Config {
             host: default_host(),
             port: default_port(),
             token: String::new(),
+            snapshot_interval_secs: default_snapshot_interval(),
             capture: CaptureConfig::default(),
             encoder: EncoderConfig::default(),
             llm: LlmConfig::default(),
@@ -241,6 +247,7 @@ impl Config {
         if self.port == 0 {
             self.port = 8080;
         }
+        self.snapshot_interval_secs = clamp(self.snapshot_interval_secs, 5, 3600);
         self.capture.clamp();
         self.encoder.clamp();
         self.llm.clamp();
@@ -340,9 +347,11 @@ mod tests {
         let low = Config::from_value(serde_json::json!({
             "capture": {"fps": 0, "scale": 0.1, "jpeg_quality": 10},
             "encoder": {"bitrate_kbps": 100, "gop_frames": 1},
-            "llm": {"interval_sec": 1}
+            "llm": {"interval_sec": 1},
+            "snapshot_interval_secs": 1
         }));
         assert_eq!(low.capture.fps, 1);
+        assert_eq!(low.snapshot_interval_secs, 5);
         assert_eq!(low.capture.scale, 0.25);
         assert_eq!(low.capture.jpeg_quality, 30);
         assert_eq!(low.encoder.bitrate_kbps, 2000);
@@ -352,7 +361,8 @@ mod tests {
         let high = Config::from_value(serde_json::json!({
             "capture": {"fps": 999, "scale": 3.0, "jpeg_quality": 100},
             "encoder": {"bitrate_kbps": 99999, "gop_frames": 999, "max_width": 8000},
-            "llm": {"interval_sec": 99999}
+            "llm": {"interval_sec": 99999},
+            "snapshot_interval_secs": 99999
         }));
         assert_eq!(high.capture.fps, 60);
         assert_eq!(high.capture.scale, 1.0);
@@ -361,6 +371,7 @@ mod tests {
         assert_eq!(high.encoder.gop_frames, 60);
         assert_eq!(high.encoder.max_width, 7680);
         assert_eq!(high.llm.interval_sec, 3600);
+        assert_eq!(high.snapshot_interval_secs, 3600);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use subtle::ConstantTimeEq;
@@ -54,6 +54,7 @@ pub struct App {
     pub model: Mutex<Arc<dyn ActionModel>>,
     pub controller: Mutex<Option<String>>,
     pub ai_cancel: Arc<AtomicBool>,
+    pub snapshot_interval: Arc<AtomicU64>,
 }
 
 impl App {
@@ -99,6 +100,7 @@ impl App {
         let (inbound_tx, inbound_rx) = mpsc::channel::<String>(64);
         let publisher = Publisher::new(hub.clone(), cfg.clone(), inbound_tx);
         let (events, _) = tokio::sync::broadcast::channel(128);
+        let snapshot_interval = Arc::new(AtomicU64::new(cfg.snapshot_interval_secs as u64));
         let app = Arc::new(Self {
             cfg: Mutex::new(cfg),
             cfg_path,
@@ -113,6 +115,7 @@ impl App {
             model: Mutex::new(model),
             controller: Mutex::new(None),
             ai_cancel: Arc::new(AtomicBool::new(false)),
+            snapshot_interval,
         });
         let app2 = app.clone();
         tokio::spawn(async move {
@@ -204,11 +207,50 @@ impl App {
         let model = self.model.lock().clone();
         let hub = self.hub.clone();
         let injector = self.injector.clone();
+        let interval = self.cfg.lock().snapshot_interval_secs as u64;
+        // Two snapshot periods plus slack: long enough for capture to produce a
+        // fresh frame after the previous step's actions, short enough that a
+        // stalled capture stops the task instead of looping on a frozen screen.
+        let fresh_timeout =
+            std::time::Duration::from_secs(interval.saturating_mul(2).saturating_add(2));
+        let grab_hub = hub.clone();
+        let wait_hub = hub.clone();
+        let last_seq = Arc::new(AtomicU64::new(hub.snap_seq()));
+        let cancel_flag = self.ai_cancel.clone();
         computer_use::run_task_async(
             task,
             model.as_ref(),
             injector.as_ref(),
-            || computer_use::grab_jpeg(&hub),
+            move || {
+                let h = grab_hub.clone();
+                async move { computer_use::grab_jpeg(&h).await }
+            },
+            move || {
+                let h = wait_hub.clone();
+                let s = last_seq.clone();
+                let cancel = cancel_flag.clone();
+                async move {
+                    // Wait in short chunks so a cancel stops the loop quickly
+                    // instead of after the full fresh-frame timeout.
+                    let mut remaining = fresh_timeout;
+                    loop {
+                        if cancel.load(Ordering::SeqCst) {
+                            return false;
+                        }
+                        let prev = s.load(Ordering::Relaxed);
+                        let chunk = remaining.min(std::time::Duration::from_millis(250));
+                        let next = h.wait_for_snap_after(prev, chunk).await;
+                        if next != prev {
+                            s.store(next, Ordering::Relaxed);
+                            return true;
+                        }
+                        remaining = remaining.saturating_sub(chunk);
+                        if remaining.is_zero() {
+                            return false;
+                        }
+                    }
+                }
+            },
             computer_use::MAX_STEPS,
             &self.ai_cancel,
         )
@@ -226,7 +268,7 @@ impl App {
         let _ = self.otp.ensure_current();
         self.push_otp_wire();
         self.publisher.start();
-        crate::snapshot::spawn(self.hub.clone());
+        crate::snapshot::spawn(self.hub.clone(), self.snapshot_interval.clone());
         let app = self.clone();
         tokio::spawn(async move {
             loop {

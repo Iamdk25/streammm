@@ -1,7 +1,8 @@
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { isPublicEdge, tokenOk } from "../src/index";
-import { sha256hex, type Env } from "../src/room";
+import { analyzeNowAllowed, sha256buf, sha256hex, shouldSkipAutoAnalysis, type Env } from "../src/room";
+import type { Analysis } from "../src/llm";
 
 async function openPublish(room?: string): Promise<WebSocket> {
   const u = new URL("https://example.com/publish");
@@ -329,5 +330,41 @@ describe("StreamRoom", () => {
     });
     expect(res.status).toBe(401);
     pub.close();
+  });
+});
+
+describe("analysis cost guards", () => {
+  it("skips the automatic pass when the frame is unchanged and the last pass succeeded", () => {
+    const last: Analysis = {
+      ts: "2026-01-01T00:00:00Z",
+      summary: "hud",
+      questions: [],
+      snapHash: "abc123",
+    };
+    expect(shouldSkipAutoAnalysis(last, "abc123")).toBe(true);
+  });
+
+  it("does not skip when the frame changed, the last pass errored, or no prior pass exists", () => {
+    const ok: Analysis = { ts: "t", summary: "hud", questions: [], snapHash: "abc123" };
+    expect(shouldSkipAutoAnalysis(ok, "different")).toBe(false);
+    expect(shouldSkipAutoAnalysis({ ...ok, error: "boom" }, "abc123")).toBe(false);
+    expect(shouldSkipAutoAnalysis({ ...ok, snapHash: undefined }, "abc123")).toBe(false);
+    expect(shouldSkipAutoAnalysis(null, "abc123")).toBe(false);
+  });
+
+  it("rate-limits manual analyze-now within the cooldown window", () => {
+    expect(analyzeNowAllowed(0, 4_999, 5_000)).toBe(false);
+    expect(analyzeNowAllowed(0, 5_000, 5_000)).toBe(true);
+    expect(analyzeNowAllowed(10_000, 12_000, 5_000)).toBe(false);
+    expect(analyzeNowAllowed(10_000, 15_000, 5_000)).toBe(true);
+  });
+
+  it("hashes raw snapshot bytes, not a string encoding of them", async () => {
+    const bytes = new TextEncoder().encode("abc");
+    const hash = await sha256buf(bytes);
+    // Known-answer test for SHA-256("abc").
+    expect(hash).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    // Distinct input must produce a distinct digest: the guard relies on it.
+    expect(await sha256buf(new TextEncoder().encode("abd"))).not.toBe(hash);
   });
 });

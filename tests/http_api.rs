@@ -549,6 +549,19 @@ async fn computer_use_forbidden_when_disabled_and_stub_when_enabled() {
     assert!(err["error"].as_str().unwrap().contains("disabled"));
 
     app.cfg.lock().control.ai_enabled = true;
+    // Simulate a live capture: the loop paces itself on fresh snapshots, so
+    // publish one before the task and keep publishing new ones while it runs.
+    use bytes::Bytes;
+    use streamaid::protocol::TYPE_SNAP;
+    app.hub
+        .publish_unit(TYPE_SNAP, Bytes::from_static(b"\xff\xd8snap0"), 0, 0);
+    let hub = app.hub.clone();
+    let frames = tokio::spawn(async move {
+        for _ in 0..6 {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            hub.publish_unit(TYPE_SNAP, Bytes::from_static(b"\xff\xd8snap"), 0, 0);
+        }
+    });
     let on = router
         .oneshot(
             Request::post("/api/computer-use")
@@ -559,6 +572,7 @@ async fn computer_use_forbidden_when_disabled_and_stub_when_enabled() {
         )
         .await
         .unwrap();
+    frames.abort();
     assert_eq!(on.status(), StatusCode::OK);
     let body = body_json(on).await;
     assert_eq!(body["ok"], true);

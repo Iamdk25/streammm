@@ -31,10 +31,30 @@ const TYPE_SNAP = 4;
 const FAIL_LIMIT = 5;
 const LOCKOUT_MS = 30_000;
 const SESSION_TTL_MS = 86_400_000;
+const ANALYZE_NOW_COOLDOWN_MS = 5_000;
 
 export async function sha256hex(s: string): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** SHA-256 over raw bytes (not a string encoding of them). */
+export async function sha256buf(u: Uint8Array): Promise<string> {
+  const buf = await crypto.subtle.digest("SHA-256", asBuf(u));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * True when the automatic analysis pass can reuse the last result: the frame
+ * is byte-identical to the one already analyzed and that pass succeeded.
+ */
+export function shouldSkipAutoAnalysis(last: Analysis | null, snapHash: string): last is Analysis {
+  return !!last && !last.error && last.snapHash === snapHash;
+}
+
+/** True when `cooldownMs` has elapsed since the last forced (paid) analysis. */
+export function analyzeNowAllowed(lastForcedAt: number, now: number, cooldownMs: number): boolean {
+  return now - lastForcedAt >= cooldownMs;
 }
 
 function hexRandom(n: number): string {
@@ -90,6 +110,7 @@ export class StreamRoom extends DurableObject<Env> {
   private sessions = new Map<string, number>();
   private fails = 0;
   private lockUntil = 0;
+  private lastForcedAt = 0;
   private flags = { control: false, ai: false };
   private flagsHydrated = false;
   private controller: string | null = null;
@@ -412,7 +433,15 @@ export class StreamRoom extends DurableObject<Env> {
       if (!ready.ok) {
         return Response.json({ error: ready.error }, { status: 503, headers });
       }
-      const result = await this.runAnalysis();
+      const now = Date.now();
+      if (!analyzeNowAllowed(this.lastForcedAt, now, ANALYZE_NOW_COOLDOWN_MS)) {
+        return Response.json(
+          { error: "rate limited — wait a few seconds between manual analyses" },
+          { status: 429, headers },
+        );
+      }
+      this.lastForcedAt = now;
+      const result = await this.runAnalysis(true);
       return Response.json(result, { headers });
     }
     if (url.pathname === "/api/ask" && request.method === "POST") {
@@ -432,13 +461,14 @@ export class StreamRoom extends DurableObject<Env> {
         return Response.json({ error: ready.error }, { status: 503, headers });
       }
       try {
-        const text = await completeVision(
+        const { text, usage } = await completeVision(
           this.lastSnap!,
           askPrompt(question),
           this.apiKey(),
           this.env.DEEPSEEK_BASE_URL || DEFAULT_BASE,
           this.env.DEEPSEEK_MODEL || DEFAULT_MODEL,
         );
+        if (usage) console.log(JSON.stringify({ message: "llm ask usage", usage }));
         const parsed = askFromModel(parseJsonObject(text));
         return Response.json(parsed, { headers });
       } catch (e) {
@@ -516,7 +546,7 @@ export class StreamRoom extends DurableObject<Env> {
     }
   }
 
-  private async runAnalysis(): Promise<Analysis> {
+  private async runAnalysis(force = false): Promise<Analysis> {
     const ready = this.llmReady();
     if (!ready.ok) {
       const a: Analysis = { ts: new Date().toISOString(), summary: "", questions: [], error: ready.error };
@@ -526,10 +556,16 @@ export class StreamRoom extends DurableObject<Env> {
     if (this.analyzing) {
       return this.lastAnalysis ?? { ts: new Date().toISOString(), summary: "", questions: [] };
     }
+    const snapHash = await sha256buf(this.lastSnap!);
+    if (!force && shouldSkipAutoAnalysis(this.lastAnalysis, snapHash)) {
+      // Frame unchanged since the last pass: reuse that result instead of
+      // spending another paid vision call.
+      return this.lastAnalysis;
+    }
     this.analyzing = true;
     const seq = this.snapSeq;
     try {
-      const text = await completeVision(
+      const { text, usage } = await completeVision(
         this.lastSnap!,
         ANALYZE_PROMPT,
         this.apiKey(),
@@ -537,6 +573,11 @@ export class StreamRoom extends DurableObject<Env> {
         this.env.DEEPSEEK_MODEL || DEFAULT_MODEL,
       );
       const a = analysisFromModel(parseJsonObject(text));
+      a.snapHash = snapHash;
+      if (usage) {
+        a.usage = usage;
+        console.log(JSON.stringify({ message: "llm analyze usage", usage }));
+      }
       this.lastAnalysis = a;
       this.history.unshift(a);
       this.history = this.history.slice(0, 30);

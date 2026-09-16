@@ -3,11 +3,13 @@
 use crate::hub::{Hub, Media};
 use crate::protocol::{TYPE_FRAG, TYPE_JPEG, TYPE_SNAP};
 use bytes::Bytes;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-/// Decode the latest video unit to a ~960px JPEG, or passthrough if already JPEG.
+/// Decode the latest video unit to a <=1920px JPEG, or passthrough if already JPEG.
 pub async fn encode_snapshot(init: Option<&[u8]>, latest: &Media) -> Option<Vec<u8>> {
     if latest.kind == TYPE_JPEG || latest.kind == TYPE_SNAP {
         if latest.data.starts_with(b"\xff\xd8") {
@@ -66,10 +68,11 @@ pub async fn encode_snapshot(init: Option<&[u8]>, latest: &Media) -> Option<Vec<
     }
 }
 
-pub fn spawn(hub: Hub) {
+pub fn spawn(hub: Hub, interval: Arc<AtomicU64>) {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(8)).await;
+            let secs = interval.load(Ordering::Relaxed).max(1);
+            tokio::time::sleep(Duration::from_secs(secs)).await;
             let Some(latest) = hub.latest() else {
                 continue;
             };
